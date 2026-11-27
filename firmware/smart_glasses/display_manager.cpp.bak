@@ -1,0 +1,454 @@
+#include "display_manager.h"
+#include "config.h" // Phải nhúng config.h để lấy chân BUTTON_PIN
+#include <U8g2lib.h>
+#include <Wire.h>
+
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /* reset=*/ U8X8_PIN_NONE, /* clock=*/ 15, /* data=*/ 14);
+static const int LIVE_DISPLAY_MAX_LINES = 64;
+static const int LIVE_DISPLAY_VISIBLE_LINES = 4;
+static const int LIVE_DISPLAY_TRANSLATION_LINES = 3;
+static const int LIVE_DISPLAY_FIRST_BASELINE = 22;
+static const int LIVE_DISPLAY_LINE_SPACING = 10;
+static const uint32_t LIVE_DISPLAY_TYPEWRITER_INTERVAL_MS = 30;
+static String live_display_lines[LIVE_DISPLAY_MAX_LINES];
+static String live_display_text = "";
+static String live_display_target_text = "";
+static String live_display_status = "Dang nghe";
+static uint8_t live_display_dots = 0;
+static int live_display_line_count = 0;
+static int live_display_first_line = 0;
+static int live_display_erase_to = -1;
+static uint32_t live_display_last_character = 0;
+static bool live_display_initialized = false;
+static bool live_display_dirty = false;
+
+// Hàm đọc thẻ ngôn ngữ và đổi Font động
+void applyDynamicFont(String &text) {
+    if (text.startsWith("[JA]")) {
+        u8g2.setFont(u8g2_font_b12_t_japanese1); // Font Tiếng Nhật
+        text = text.substring(4); // Xóa thẻ [JA] đi
+    } 
+    else if (text.startsWith("[ZH]")) {
+        u8g2.setFont(u8g2_font_wqy12_t_gb2312); // Font Tiếng Trung
+        text = text.substring(4);
+    } 
+    else if (text.startsWith("[KO]")) {
+        u8g2.setFont(u8g2_font_unifont_t_korean1); // Font Tiếng Hàn
+        text = text.substring(4);
+    } 
+    else if (text.startsWith("[VI]")) {
+        u8g2.setFont(u8g2_font_unifont_t_vietnamese1); // Font Tiếng Việt & Châu Âu
+        text = text.substring(4);
+    } 
+    else {
+        u8g2.setFont(u8g2_font_unifont_t_vietnamese1); // Mặc định
+    }
+}
+
+void initDisplay() {
+    Wire.begin(14, 15);
+    u8g2.begin();
+    u8g2.enableUTF8Print(); 
+}
+
+void displayMessage(String msg) {
+    applyDynamicFont(msg);
+    u8g2.clearBuffer();
+     
+    int y_pos = 32;
+    int start = 0;
+    int end = msg.indexOf('\n');
+    while (end != -1) {
+        u8g2.setCursor(0, y_pos);
+        u8g2.print(msg.substring(start, end));
+        y_pos += 16;
+        start = end + 1;
+        end = msg.indexOf('\n', start);
+    }
+    u8g2.setCursor(0, y_pos);
+    u8g2.print(msg.substring(start));
+    u8g2.sendBuffer();
+}
+
+static void appendLiveDisplayLine(String line) {
+    if (live_display_line_count < LIVE_DISPLAY_MAX_LINES) {
+        live_display_lines[live_display_line_count++] = line;
+        return;
+    }
+
+    for (int i = 1; i < LIVE_DISPLAY_MAX_LINES; i++) {
+        live_display_lines[i - 1] = live_display_lines[i];
+    }
+    live_display_lines[LIVE_DISPLAY_MAX_LINES - 1] = line;
+}
+
+void resetLiveTranscriptDisplay() {
+    live_display_text = "";
+    live_display_target_text = "";
+    live_display_status = "Dang nghe";
+    live_display_dots = 0;
+    live_display_line_count = 0;
+    live_display_first_line = 0;
+    live_display_erase_to = -1;
+    live_display_last_character = 0;
+    live_display_initialized = false;
+    live_display_dirty = false;
+}
+
+void setLiveTranscriptStatus(String status) {
+    if (live_display_status == status) return;
+    live_display_status = status;
+    live_display_dirty = true;
+}
+
+static void rebuildLiveDisplayLines(String text, bool compactFont) {
+    if (compactFont) {
+        u8g2.setFont(u8g2_font_6x10_tf);
+    } else {
+        applyDynamicFont(text);
+    }
+    live_display_line_count = 0;
+    String current_word = "";
+    text += " ";
+
+    for (int i = 0; i < text.length(); i++) {
+        char c = text[i];
+        if (c == ' ' || c == '\n') {
+            if (current_word.length() == 0) continue;
+
+            String candidate =
+                live_display_lines[live_display_line_count > 0
+                    ? live_display_line_count - 1 : 0]
+                + current_word + " ";
+            if (live_display_line_count > 0 &&
+                u8g2.getUTF8Width(candidate.c_str()) > 128) {
+                appendLiveDisplayLine("");
+                live_display_lines[live_display_line_count - 1] =
+                    current_word + " ";
+            } else if (live_display_line_count == 0) {
+                appendLiveDisplayLine(current_word + " ");
+            } else {
+                live_display_lines[live_display_line_count - 1] +=
+                    current_word + " ";
+            }
+            current_word = "";
+        } else {
+            current_word += c;
+        }
+    }
+
+    live_display_dirty = true;
+}
+
+static bool isUtf8Continuation(char value) {
+    return (static_cast<uint8_t>(value) & 0xC0) == 0x80;
+}
+
+static int previousUtf8Boundary(const String &text, int end) {
+    int start = end - 1;
+    while (start > 0 && isUtf8Continuation(text[start])) {
+        start--;
+    }
+    return start;
+}
+
+static void renderLiveText(String title, bool compactFont) {
+    if (!live_display_initialized) return;
+
+    if (compactFont) {
+        u8g2.setFont(u8g2_font_6x10_tf);
+    } else {
+        u8g2.setFont(u8g2_font_unifont_t_vietnamese1);
+    }
+
+    uint32_t now = millis();
+    if (title == live_display_status) {
+        uint8_t dots = (now / 350) % 4;
+        if (dots != live_display_dots) {
+            live_display_dots = dots;
+            live_display_dirty = true;
+        }
+        for (uint8_t i = 0; i < live_display_dots; i++) {
+            title += ".";
+        }
+    } else if (live_display_dots != 0) {
+        live_display_dots = 0;
+        live_display_dirty = true;
+    }
+
+    int visible_lines = compactFont
+        ? LIVE_DISPLAY_VISIBLE_LINES
+        : LIVE_DISPLAY_TRANSLATION_LINES;
+    if (!live_display_dirty) return;
+
+    u8g2.clearBuffer();
+    u8g2.setCursor(0, compactFont ? 9 : 12);
+    u8g2.print(title);
+    if (compactFont) {
+        u8g2.drawLine(0, 12, 127, 12);
+    }
+    for (int i = 0; i < visible_lines; i++) {
+        int line_index = live_display_first_line + i;
+        if (line_index < live_display_line_count &&
+            live_display_lines[line_index].length() > 0) {
+            int baseline = compactFont
+                ? LIVE_DISPLAY_FIRST_BASELINE +
+                    (i * LIVE_DISPLAY_LINE_SPACING)
+                : 30 + (i * 16);
+            u8g2.setCursor(0, baseline);
+            u8g2.print(live_display_lines[line_index]);
+        }
+    }
+    u8g2.sendBuffer();
+    live_display_dirty = false;
+}
+
+static void displayLiveText(
+    String title,
+    String text,
+    bool compactFont,
+    bool typewriter = false
+) {
+    bool visible_changed = false;
+    if (text != live_display_target_text) {
+        live_display_target_text = text;
+        if (typewriter) {
+            int common_prefix = 0;
+            int max_common = live_display_text.length();
+            if (max_common > live_display_target_text.length()) {
+                max_common = live_display_target_text.length();
+            }
+            while (common_prefix < max_common &&
+                   live_display_text[common_prefix] ==
+                       live_display_target_text[common_prefix]) {
+                common_prefix++;
+            }
+            while (common_prefix > 0 &&
+                   common_prefix < live_display_target_text.length() &&
+                   isUtf8Continuation(
+                       live_display_target_text[common_prefix]
+                   )) {
+                common_prefix--;
+            }
+            while (common_prefix > 0 &&
+                   common_prefix < live_display_target_text.length() &&
+                   live_display_target_text[common_prefix] != ' ' &&
+                   live_display_target_text[common_prefix - 1] != ' ') {
+                common_prefix = previousUtf8Boundary(
+                    live_display_target_text,
+                    common_prefix
+                );
+            }
+            if (common_prefix < live_display_text.length()) {
+                live_display_erase_to = common_prefix;
+            } else {
+                live_display_erase_to = -1;
+            }
+        } else {
+            visible_changed = live_display_text != live_display_target_text;
+            live_display_text = live_display_target_text;
+            live_display_erase_to = -1;
+        }
+    }
+    uint32_t now = millis();
+    bool animation_due = now - live_display_last_character >=
+        LIVE_DISPLAY_TYPEWRITER_INTERVAL_MS;
+    if (typewriter && animation_due &&
+        (live_display_erase_to >= 0 ||
+         live_display_text.length() < live_display_target_text.length())) {
+        if (live_display_erase_to >= 0 &&
+            live_display_text.length() > live_display_erase_to) {
+            int previous_boundary = previousUtf8Boundary(
+                live_display_text,
+                live_display_text.length()
+            );
+            live_display_text.remove(previous_boundary);
+            if (live_display_text.length() <= live_display_erase_to) {
+                live_display_erase_to = -1;
+            }
+        } else {
+            live_display_erase_to = -1;
+            int next_boundary = live_display_text.length() + 1;
+            while (next_boundary < live_display_target_text.length() &&
+                   isUtf8Continuation(
+                       live_display_target_text[next_boundary]
+                   )) {
+                next_boundary++;
+            }
+            live_display_text += live_display_target_text.substring(
+                live_display_text.length(),
+                next_boundary
+            );
+        }
+        live_display_last_character = now;
+        visible_changed = true;
+    }
+
+    if (!live_display_initialized || visible_changed) {
+        rebuildLiveDisplayLines(live_display_text, compactFont);
+        live_display_initialized = true;
+
+        int visible_lines = compactFont
+            ? LIVE_DISPLAY_VISIBLE_LINES
+            : LIVE_DISPLAY_TRANSLATION_LINES;
+        int max_first_line = live_display_line_count - visible_lines;
+        if (max_first_line < 0) max_first_line = 0;
+        if (compactFont) {
+            if (live_display_line_count >
+                live_display_first_line + visible_lines) {
+                live_display_first_line = max_first_line;
+            } else if (live_display_first_line > max_first_line) {
+                live_display_first_line = max_first_line;
+            }
+        } else if (live_display_first_line > max_first_line) {
+            live_display_first_line = max_first_line;
+        }
+    }
+
+    if (title == "Phu de (EN):") {
+        title = live_display_status;
+    }
+    renderLiveText(title, compactFont);
+}
+
+void displayLiveTranscript(String text) {
+    displayLiveText("Phu de (EN):", text, true, true);
+}
+
+void displayLiveTranscriptParts(String stableText, String interimText) {
+    String text = stableText;
+    if (interimText.length() > 0) {
+        if (text.length() > 0) text += " ";
+        text += interimText;
+    }
+
+    displayLiveText("Phu de (EN):", text, true, true);
+}
+
+void displayCorrectedLiveTranscript(String text) {
+    displayLiveText("Phu de (EN):", text, true, true);
+}
+
+void updateLiveTranscriptDisplay() {
+    displayLiveText("Phu de (EN):", live_display_target_text, true, true);
+}
+
+void displayFinalTranscript(String text) {
+    displayLiveText("STT - Bam nut xem dich", text, true, true);
+}
+
+void displayLiveTranslation(String text) {
+    displayLiveText("Ban dich truc tiep:", text, false);
+}
+
+// Hàm delay thông minh: Trả về 'true' ngay lập tức nếu nút bị nhấn
+bool waitOrInterrupt(uint32_t ms) {
+    uint32_t start = millis();
+    while(millis() - start < ms) {
+        if (digitalRead(BUTTON_PIN) == LOW) {
+            return true; // Bị ngắt
+        }
+        delay(10);
+    }
+    return false;
+}
+
+// Hàm cuộn chữ (trả về bool để biết có bị hủy ngang không)
+bool printPagedText(String title, String text) {
+    applyDynamicFont(text);
+    
+    String lines[3] = {"", "", ""}; 
+    int current_row = 0;
+    text += " "; 
+    String current_word = "";
+    
+    for (int i = 0; i < text.length(); i++) {
+        char c = text[i];
+        if (c == ' ' || c == '\n') {
+            String test_line = lines[current_row] + current_word;
+            int text_width = u8g2.getUTF8Width(test_line.c_str());
+            
+            if (text_width > 128 && lines[current_row].length() > 0) {
+                if (current_row >= 2) {
+                    // Chờ 2.5s trước khi cuộn, nếu bấm nút thì thoát ngay
+                    if (waitOrInterrupt(3000)) return true; 
+                    lines[0] = lines[1];
+                    lines[1] = lines[2];
+                    lines[2] = current_word + " "; 
+                } else {
+                    current_row++;
+                    lines[current_row] = current_word + " ";
+                }
+            } else {
+                lines[current_row] += current_word + " ";
+            }
+            current_word = "";
+            
+            u8g2.clearBuffer();
+            u8g2.setCursor(0, 14); u8g2.print(title);
+            u8g2.drawLine(0, 16, 128, 16);
+            if (lines[0] != "") { u8g2.setCursor(0, 32); u8g2.print(lines[0]); }
+            if (lines[1] != "") { u8g2.setCursor(0, 48); u8g2.print(lines[1]); }
+            if (lines[2] != "") { u8g2.setCursor(0, 64); u8g2.print(lines[2]); }
+            u8g2.sendBuffer();
+            
+            // Kiểm tra nút ngay cả lúc gõ chữ
+            if (waitOrInterrupt(30)) return true; 
+            
+            if (c == '\n') {
+                if (current_row >= 2) {
+                    if (waitOrInterrupt(3000)) return true;
+                    lines[0] = lines[1];
+                    lines[1] = lines[2];
+                    lines[2] = "";
+                } else {
+                    current_row++;
+                }
+            }
+        } else {
+            current_word += c;
+        }
+    }
+    
+    if (current_word.length() > 0) {
+        lines[current_row] += current_word;
+        u8g2.clearBuffer();
+        u8g2.setCursor(0, 14); u8g2.print(title);
+        u8g2.drawLine(0, 16, 128, 16);
+        if (lines[0] != "") { u8g2.setCursor(0, 32); u8g2.print(lines[0]); }
+        if (lines[1] != "") { u8g2.setCursor(0, 48); u8g2.print(lines[1]); }
+        if (lines[2] != "") { u8g2.setCursor(0, 64); u8g2.print(lines[2]); }
+        u8g2.sendBuffer();
+    }
+    
+    // Đợi 2.5s sau khi xong một trang (Anh/Việt) 
+    if (waitOrInterrupt(3000)) return true; 
+    return false; // Hoàn thành trọn vẹn
+}
+
+void displayTranslation(String original, String translated) {
+    // Nếu bị ngắt khi đang lật chữ -> lập tức reset về trạng thái chờ
+    if (printPagedText("Tieng Anh:", original)) {
+        displayMessage("San sang...\n(Bam de noi)");
+        return;
+    }
+    if (printPagedText("Tieng Viet:", translated)) {
+        displayMessage("San sang...\n(Bam de noi)");
+        return;
+    }
+    
+    // Nếu chạy hết bình thường, đợi 4 giây rồi reset về màn hình chờ
+    if (!waitOrInterrupt(4000)) {
+        displayMessage("San sang...\n(Bam de noi)");
+    } else {
+        displayMessage("San sang...\n(Bam de noi)");
+    }
+}
+
+void displayTranslationOnly(String translated) {
+    if (printPagedText("Tieng Viet:", translated)) {
+        displayMessage("San sang...\n(Bam de noi)");
+        return;
+    }
+    displayMessage("San sang...\n(Bam de noi)");
+}
